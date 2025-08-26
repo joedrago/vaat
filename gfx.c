@@ -484,7 +484,7 @@ static int gfxConvertSample(struct Gfx * gfx)
             printf("Failed to create UV plane image with GR88\n");
             uvTexture = 0;
         } else {
-            printf("GR88 format worked!\n");
+            // printf("GR88 format worked!\n");
             glGenTextures(1, &uvTexture);
             glBindTexture(GL_TEXTURE_2D, uvTexture);
             glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, uvImage);
