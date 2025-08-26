@@ -232,7 +232,7 @@ int main(int argc, char * argv[])
     for (;;) {
         printf("rendering graphics...\n");
         gfxRender(app->gfx);
-        sleep(1);
+        usleep(1000000 / 60);
     }
 
     appDestroy(app);
