@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <wayland-egl.h>
 
@@ -12,38 +13,79 @@
 #include <gst/gl/egl/gsteglimage.h>
 #include <gst/gl/egl/gstgldisplay_egl.h>
 #include <gst/gl/gl.h>
+#include <gst/video/video-info-dma.h>
+#include <gst/video/video.h>
 #include <gst/video/videooverlay.h>
 
+#include <drm/drm_fourcc.h>
+
+static const char * vertexShaderSource = "attribute vec2 position;\n"
+                                         "attribute vec2 texCoord;\n"
+                                         "varying vec2 v_texCoord;\n"
+                                         "void main() {\n"
+                                         "    gl_Position = vec4(position, 0.0, 1.0);\n"
+                                         "    v_texCoord = texCoord;\n"
+                                         "}\n";
+
+static const char * fragmentShaderSource = "precision mediump float;\n"
+                                           "varying vec2 v_texCoord;\n"
+                                           "uniform sampler2D u_texture;\n"
+                                           "void main() {\n"
+                                           "    gl_FragColor = texture2D(u_texture, v_texCoord);\n"
+                                           "}\n";
+
+static const char * yuvVertexShaderSource = "attribute vec2 position;\n"
+                                            "attribute vec2 texCoord;\n"
+                                            "varying vec2 v_texCoord;\n"
+                                            "void main() {\n"
+                                            "    gl_Position = vec4(position, 0.0, 1.0);\n"
+                                            "    v_texCoord = texCoord;\n"
+                                            "}\n";
+
+static const char * yuvFragmentShaderSource = "precision mediump float;\n"
+                                              "varying vec2 v_texCoord;\n"
+                                              "uniform sampler2D u_textureY;\n"
+                                              "uniform sampler2D u_textureUV;\n"
+                                              "uniform int u_hasUV;\n"
+                                              "void main() {\n"
+                                              "    vec2 yCoord = v_texCoord;\n"
+                                              "    vec2 uvCoord = v_texCoord;\n"
+                                              "    float y = texture2D(u_textureY, yCoord).r;\n"
+                                              "    if (u_hasUV == 1) {\n"
+                                              "        vec2 uv_sample = texture2D(u_textureUV, uvCoord).rg - 0.5;\n"
+                                              "        float u = uv_sample.r;\n"
+                                              "        float v = uv_sample.g;\n"
+                                              "        float r = y + 1.5748 * v;\n"
+                                              "        float g = y - 0.1873 * u - 0.4681 * v;\n"
+                                              "        float b = y + 1.8556 * u;\n"
+                                              "        gl_FragColor = vec4(r, g, b, 1.0);\n"
+                                              "    } else {\n"
+                                              "        gl_FragColor = vec4(y, y, y, 1.0);\n"
+                                              "    }\n"
+                                              "}\n";
+
 // clang-format off
-static const char* vertexShaderSource =
-    "attribute vec2 position;\n"
-    "attribute vec2 texCoord;\n"
-    "varying vec2 v_texCoord;\n"
-    "void main() {\n"
-    "    gl_Position = vec4(position, 0.0, 1.0);\n"
-    "    v_texCoord = texCoord;\n"
-    "}\n";
-
-static const char* fragmentShaderSource =
-    "precision mediump float;\n"
-    "varying vec2 v_texCoord;\n"
-    "uniform sampler2D u_texture;\n"
-    "void main() {\n"
-    "    gl_FragColor = texture2D(u_texture, v_texCoord);\n"
-    "}\n";
-
 static unsigned char debugTextureData[] = { 255,   0,   0, 255,
                                               0, 255,   0, 255,
                                               0,   0, 255, 255,
                                             255, 255,   0, 255 };
 
-static GLfloat vertices[] = { -0.5f, -0.5f,  0.0f,  0.0f,
-                               0.5f, -0.5f,  1.0f,  0.0f,
-                               0.5f,  0.5f,  1.0f,  1.0f,
-                              -0.5f,  0.5f,  0.0f,  1.0f };
+static GLfloat convertVertices[] = { -1.0f, -1.0f,  0.0f,  0.0f,
+                                      1.0f, -1.0f,  1.0f,  0.0f,
+                                      1.0f,  1.0f,  1.0f,  1.0f,
+                                     -1.0f,  1.0f,  0.0f,  1.0f };
+
+static GLfloat renderVertices[]  = { -1.0f, -1.0f,  0.0f,  1.0f,
+                                      1.0f, -1.0f,  1.0f,  1.0f,
+                                      1.0f,  1.0f,  1.0f,  0.0f,
+                                     -1.0f,  1.0f,  0.0f,  0.0f };
 
 static GLuint indices[] = { 0, 1, 2, 2, 3, 0 };
 // clang-format on
+
+static PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR = NULL;
+static PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR = NULL;
+static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = NULL;
 
 struct Gfx
 {
@@ -54,8 +96,17 @@ struct Gfx
     EGLDisplay eglDisplay;
 
     GLuint shaderProgram;
+    GLuint yuvShaderProgram;
     GLuint debugTexture;
     GLuint videoTexture;
+    GLuint rgbTexture;
+    GLuint framebuffer;
+
+    int width;
+    int height;
+
+    int videoWidth;
+    int videoHeight;
 
     struct Player * player;
     GstSample * sample;
@@ -64,6 +115,8 @@ struct Gfx
 struct Gfx * gfxCreate(struct wl_display * display, struct wl_surface * surface, int width, int height, struct Player * player)
 {
     struct Gfx * gfx = calloc(1, sizeof(struct Gfx));
+    gfx->width = width;
+    gfx->height = height;
     gfx->player = player;
 
     gfx->eglNative = wl_egl_window_create(surface, width, height);
@@ -122,14 +175,42 @@ struct Gfx * gfxCreate(struct wl_display * display, struct wl_surface * surface,
     glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
     glCompileShader(vertexShader);
 
+    GLint success;
+    glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        GLchar infoLog[512];
+        glGetShaderInfoLog(vertexShader, 512, NULL, infoLog);
+        printf("Vertex shader compilation failed: %s\n", infoLog);
+        fatal("Vertex shader compilation failed");
+    }
+
     GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
     glShaderSource(fragmentShader, 1, &fragmentShaderSource, NULL);
     glCompileShader(fragmentShader);
+
+    glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        GLchar infoLog[512];
+        glGetShaderInfoLog(fragmentShader, 512, NULL, infoLog);
+        printf("Fragment shader compilation failed: %s\n", infoLog);
+        fatal("Fragment shader compilation failed");
+    }
 
     gfx->shaderProgram = glCreateProgram();
     glAttachShader(gfx->shaderProgram, vertexShader);
     glAttachShader(gfx->shaderProgram, fragmentShader);
     glLinkProgram(gfx->shaderProgram);
+
+    glGetProgramiv(gfx->shaderProgram, GL_LINK_STATUS, &success);
+    if (!success) {
+        GLchar infoLog[512];
+        glGetProgramInfoLog(gfx->shaderProgram, 512, NULL, infoLog);
+        printf("Shader program linking failed: %s\n", infoLog);
+        fatal("Shader program linking failed");
+    }
+
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
 
     glGenTextures(1, &gfx->debugTexture);
     glBindTexture(GL_TEXTURE_2D, gfx->debugTexture);
@@ -137,18 +218,97 @@ struct Gfx * gfxCreate(struct wl_display * display, struct wl_surface * surface,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
+    eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+    eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+    glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+
+    GLuint yuvVertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(yuvVertexShader, 1, &yuvVertexShaderSource, NULL);
+    glCompileShader(yuvVertexShader);
+
+    glGetShaderiv(yuvVertexShader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        GLchar infoLog[512];
+        glGetShaderInfoLog(yuvVertexShader, 512, NULL, infoLog);
+        printf("YUV vertex shader compilation failed: %s\n", infoLog);
+        fatal("YUV vertex shader compilation failed");
+    }
+
+    GLuint yuvFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(yuvFragmentShader, 1, &yuvFragmentShaderSource, NULL);
+    glCompileShader(yuvFragmentShader);
+
+    glGetShaderiv(yuvFragmentShader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        GLchar infoLog[512];
+        glGetShaderInfoLog(yuvFragmentShader, 512, NULL, infoLog);
+        printf("YUV fragment shader compilation failed: %s\n", infoLog);
+        fatal("YUV fragment shader compilation failed");
+    }
+
+    gfx->yuvShaderProgram = glCreateProgram();
+    glAttachShader(gfx->yuvShaderProgram, yuvVertexShader);
+    glAttachShader(gfx->yuvShaderProgram, yuvFragmentShader);
+    glLinkProgram(gfx->yuvShaderProgram);
+
+    glGetProgramiv(gfx->yuvShaderProgram, GL_LINK_STATUS, &success);
+    if (!success) {
+        GLchar infoLog[512];
+        glGetProgramInfoLog(gfx->yuvShaderProgram, 512, NULL, infoLog);
+        printf("YUV shader program linking failed: %s\n", infoLog);
+        fatal("YUV shader program linking failed");
+    }
+
+    glDeleteShader(yuvVertexShader);
+    glDeleteShader(yuvFragmentShader);
+
     return gfx;
 }
 
 void gfxDestroy(struct Gfx * gfx)
 {
-    // TODO: implement
+    if (!gfx)
+        return;
 
-    // free(gfx);
+    if (gfx->sample) {
+        gst_sample_unref(gfx->sample);
+    }
+
+    if (gfx->debugTexture) {
+        glDeleteTextures(1, &gfx->debugTexture);
+    }
+    if (gfx->rgbTexture) {
+        glDeleteTextures(1, &gfx->rgbTexture);
+    }
+    if (gfx->framebuffer) {
+        glDeleteFramebuffers(1, &gfx->framebuffer);
+    }
+
+    if (gfx->shaderProgram) {
+        glDeleteProgram(gfx->shaderProgram);
+    }
+    if (gfx->yuvShaderProgram) {
+        glDeleteProgram(gfx->yuvShaderProgram);
+    }
+
+    if (gfx->eglContext != EGL_NO_CONTEXT) {
+        eglDestroyContext(gfx->eglDisplay, gfx->eglContext);
+    }
+    if (gfx->eglSurface != EGL_NO_SURFACE) {
+        eglDestroySurface(gfx->eglDisplay, gfx->eglSurface);
+    }
+    if (gfx->eglDisplay != EGL_NO_DISPLAY) {
+        eglTerminate(gfx->eglDisplay);
+    }
+    if (gfx->eglNative) {
+        wl_egl_window_destroy(gfx->eglNative);
+    }
+
+    free(gfx);
 }
 
 // returns non-zero on success
-static int gfxConvertSample(struct Gfx * gfx, GLuint * outTexture)
+static int gfxConvertSample(struct Gfx * gfx)
 {
     GstBuffer * buffer = gst_sample_get_buffer(gfx->sample);
     gint64 const pts = (gint64)GST_BUFFER_PTS(buffer);
@@ -159,72 +319,257 @@ static int gfxConvertSample(struct Gfx * gfx, GLuint * outTexture)
     printf("adopted [%3.3f]: %s\n", (double)pts / 1000000000.0, capsString);
     g_free(capsString);
 
-#if 0
-    GstVideoInfoDmaDrm * videoInfo = gst_video_info_dma_drm_new_from_caps(caps);
+    if (!eglCreateImageKHR || !eglDestroyImageKHR || !glEGLImageTargetTexture2DOES) {
+        printf("EGL extensions not available\n");
+        return 0;
+    }
 
-    guint idx = 0;
-    guint length = 0;
-    gsize skip = 0;
-    if (gst_buffer_find_memory(buffer, 0, 1, &idx, &length, &skip)) {
-        printf("gst_buffer_find_memory returned true %u %u %zu\n", idx, length, skip);
+    GstVideoInfoDmaDrm dma_info;
+    if (!gst_video_info_dma_drm_from_caps(&dma_info, caps)) {
+        printf("Failed to get DMA DRM video info from caps\n");
+        return 0;
+    }
+
+    gint width = GST_VIDEO_INFO_WIDTH(&dma_info.vinfo);
+    gint height = GST_VIDEO_INFO_HEIGHT(&dma_info.vinfo);
+    guint32 fourcc = dma_info.drm_fourcc;
+
+    if (fourcc != DRM_FORMAT_NV12 && fourcc != DRM_FORMAT_NV21) {
+        printf("Unsupported DRM fourcc: 0x%08x\n", fourcc);
+        return 0;
+    }
+
+    // Get DMA-BUF fd from first memory block
+    GstMemory * mem = gst_buffer_peek_memory(buffer, 0);
+    if (!mem || !gst_is_dmabuf_memory(mem)) {
+        printf("Buffer is not DMA-BUF memory\n");
+        return 0;
+    }
+
+    gint fd = gst_dmabuf_memory_get_fd(mem);
+    if (fd < 0) {
+        printf("Failed to get DMA-BUF fd\n");
+        return 0;
+    }
+
+    // Try to get stride/offset from VideoMeta first, fall back to VideoInfo
+    gsize y_offset, uv_offset;
+    gint y_stride, uv_stride;
+
+    GstVideoMeta * video_meta = gst_buffer_get_video_meta(buffer);
+    if (video_meta) {
+        y_offset = video_meta->offset[0];
+        y_stride = video_meta->stride[0];
+        uv_offset = video_meta->offset[1];
+        uv_stride = video_meta->stride[1];
+        // printf("Using VideoMeta: Y stride=%d offset=%zu, UV stride=%d offset=%zu\n", y_stride, y_offset, uv_stride, uv_offset);
     } else {
-        printf("gst_buffer_find_memory returned false\n");
+        // Fall back to GstVideoInfo plane offsets
+        y_offset = GST_VIDEO_INFO_PLANE_OFFSET(&dma_info.vinfo, 0);
+        y_stride = GST_VIDEO_INFO_PLANE_STRIDE(&dma_info.vinfo, 0);
+        uv_offset = GST_VIDEO_INFO_PLANE_OFFSET(&dma_info.vinfo, 1);
+        uv_stride = GST_VIDEO_INFO_PLANE_STRIDE(&dma_info.vinfo, 1);
+        // printf("Using VideoInfo: Y stride=%d offset=%zu, UV stride=%d offset=%zu\n", y_stride, y_offset, uv_stride, uv_offset);
     }
 
-    // if (videoInfo) {
-    //     // printf("unref video info\n");
-    //     // gst_object_unref(GST_OBJECT(videoInfo));
-    // }
+    // printf("DMA-BUF fd=%d, Y: offset=%zu stride=%d, UV: offset=%zu stride=%d, fourcc=0x%08x, %dx%d\n",
+    //        fd,
+    //        y_offset,
+    //        y_stride,
+    //        uv_offset,
+    //        uv_stride,
+    //        fourcc,
+    //        width,
+    //        height);
 
-    GstGLDisplayEGL * gstEglDisplay = gst_gl_display_egl_new_with_egl_display(gfx->eglDisplay);
+    GLuint externalTexture;
+    glGenTextures(1, &externalTexture);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, externalTexture);
 
-    GError * error = NULL;
+    EGLImage image = EGL_NO_IMAGE;
 
-    GstGLContext * gstParentContext =
-        gst_gl_context_new_wrapped((GstGLDisplay *)gstEglDisplay, (guintptr)gfx->eglContext, GST_GL_PLATFORM_EGL, GST_GL_API_GLES2);
-    gst_gl_context_activate(gstParentContext, TRUE);
-    if (!gst_gl_context_fill_info(gstParentContext, &error)) {
-        printf("gst_gl_context_fill_info bad\n");
+    if (gfx->videoWidth != width || gfx->videoHeight != height) {
+        if (gfx->rgbTexture) {
+            glDeleteTextures(1, &gfx->rgbTexture);
+        }
+        if (gfx->framebuffer) {
+            glDeleteFramebuffers(1, &gfx->framebuffer);
+        }
+
+        glGenTextures(1, &gfx->rgbTexture);
+        glBindTexture(GL_TEXTURE_2D, gfx->rgbTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        // printf("Created RGB texture %d (%dx%d)\n", gfx->rgbTexture, width, height);
+
+        glGenFramebuffers(1, &gfx->framebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, gfx->framebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gfx->rgbTexture, 0);
+
+        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        // printf("Framebuffer status: 0x%x (complete=0x%x)\n", status, GL_FRAMEBUFFER_COMPLETE);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            printf("Framebuffer is not complete\n");
+            glDeleteTextures(1, &externalTexture);
+            eglDestroyImageKHR(gfx->eglDisplay, image);
+            return 0;
+        }
+
+        gfx->videoWidth = width;
+        gfx->videoHeight = height;
     }
 
-    if (error) {
-        printf("gst_gl_context_fill_info error: %s\n", error->message);
-        g_error_free(error);
-        error = NULL;
+    // Let's try just filling the RGB texture with a solid color to test
+    glBindFramebuffer(GL_FRAMEBUFFER, gfx->framebuffer);
+    glViewport(0, 0, width, height);
+    glClearColor(1.0, 0.0, 0.0, 1.0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0); // Unbind framebuffer
+
+    // Create Y plane texture
+    EGLint yAttribs[] = { EGL_WIDTH,
+                          width,
+                          EGL_HEIGHT,
+                          height,
+                          EGL_LINUX_DRM_FOURCC_EXT,
+                          DRM_FORMAT_R8,
+                          EGL_DMA_BUF_PLANE0_FD_EXT,
+                          fd,
+                          EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                          y_offset,
+                          EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                          y_stride,
+                          EGL_NONE };
+
+    EGLImage yImage = eglCreateImageKHR(gfx->eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, yAttribs);
+    if (yImage == EGL_NO_IMAGE) {
+        printf("Failed to create Y plane image\n");
+        glDeleteTextures(1, &externalTexture);
+        return 0;
     }
 
-    GstGLContext * gstEglContext = gst_gl_context_new((GstGLDisplay *)gstEglDisplay);
-    gst_gl_context_create(gstEglContext, NULL /*gstParentContext*/, &error);
-    gst_gl_context_activate(gstEglContext, TRUE);
-    if (error) {
-        printf("gst_gl_context_create error: %s\n", error->message);
-        g_error_free(error);
-        error = NULL;
+    GLuint yTexture;
+    glGenTextures(1, &yTexture);
+    glBindTexture(GL_TEXTURE_2D, yTexture);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, yImage);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    GLuint uvTexture = 0;
+    EGLImage uvImage = EGL_NO_IMAGE;
+
+    if (fourcc == DRM_FORMAT_NV12) {
+        EGLint uvAttribs[] = { EGL_WIDTH,
+                               width / 2,
+                               EGL_HEIGHT,
+                               height / 2,
+                               EGL_LINUX_DRM_FOURCC_EXT,
+                               DRM_FORMAT_GR88,
+                               EGL_DMA_BUF_PLANE0_FD_EXT,
+                               fd,
+                               EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                               uv_offset,
+                               EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                               uv_stride,
+                               EGL_NONE };
+
+        uvImage = eglCreateImageKHR(gfx->eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, uvAttribs);
+        if (uvImage == EGL_NO_IMAGE) {
+            printf("Failed to create UV plane image with GR88\n");
+            uvTexture = 0;
+        } else {
+            printf("GR88 format worked!\n");
+            glGenTextures(1, &uvTexture);
+            glBindTexture(GL_TEXTURE_2D, uvTexture);
+            glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, uvImage);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
     }
 
-    assert(gstEglDisplay);
-    assert(gstParentContext);
-    assert(gstEglContext);
+    // Render YUV to RGB
+    GLint oldViewport[4];
+    glGetIntegerv(GL_VIEWPORT, oldViewport);
+    GLint oldFramebuffer;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &oldFramebuffer);
+    GLint oldProgram;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &oldProgram);
+    GLint oldActiveTexture;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActiveTexture);
+    GLint oldTexture0, oldTexture1;
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexture0);
+    glActiveTexture(GL_TEXTURE1);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexture1);
 
-    gint fd = gst_dmabuf_memory_get_fd(gst_buffer_peek_memory(buffer, idx));
-    printf("got fd %u\b", fd);
+    // Save vertex attribute array state
+    GLint oldArrayBuffer;
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &oldArrayBuffer);
 
-    GstEGLImage * gstImage = gst_egl_image_from_dmabuf_direct(gfx->eglContext, &fd, &skip, &videoInfo->vinfo);
-    gst_object_unref(GST_OBJECT(gstImage));
+    glBindFramebuffer(GL_FRAMEBUFFER, gfx->framebuffer);
+    glViewport(0, 0, width, height);
+    glUseProgram(gfx->yuvShaderProgram);
 
-    if (gstEglContext) {
-        gst_gl_context_destroy(gstEglContext);
-        gst_object_unref(GST_OBJECT(gstEglContext));
+    GLint positionAttrib = glGetAttribLocation(gfx->yuvShaderProgram, "position");
+    GLint texCoordAttrib = glGetAttribLocation(gfx->yuvShaderProgram, "texCoord");
+    GLint yTextureUniform = glGetUniformLocation(gfx->yuvShaderProgram, "u_textureY");
+    GLint uvTextureUniform = glGetUniformLocation(gfx->yuvShaderProgram, "u_textureUV");
+    GLint hasUVUniform = glGetUniformLocation(gfx->yuvShaderProgram, "u_hasUV");
+
+    glEnableVertexAttribArray(positionAttrib);
+    glVertexAttribPointer(positionAttrib, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), convertVertices);
+    glEnableVertexAttribArray(texCoordAttrib);
+    glVertexAttribPointer(texCoordAttrib, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), convertVertices + 2);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, yTexture);
+    glUniform1i(yTextureUniform, 0);
+
+    if (uvTexture != 0) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, uvTexture);
+        glUniform1i(uvTextureUniform, 1);
+        glUniform1i(hasUVUniform, 1);
+    } else {
+        glUniform1i(hasUVUniform, 0);
     }
-    // if (gstParentContext) {
-    //     gst_object_unref(GST_OBJECT(gstParentContext));
-    // }
-    if (gstEglDisplay) {
-        gst_object_unref(GST_OBJECT(gstEglDisplay));
-    }
 
-#endif
-    return 0;
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, indices);
+
+    // Restore all OpenGL state
+    glBindFramebuffer(GL_FRAMEBUFFER, oldFramebuffer);
+    glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
+    glUseProgram(oldProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, oldTexture0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, oldTexture1);
+    glActiveTexture(oldActiveTexture);
+    glBindBuffer(GL_ARRAY_BUFFER, oldArrayBuffer);
+    glDisableVertexAttribArray(positionAttrib);
+    glDisableVertexAttribArray(texCoordAttrib);
+
+    // Cleanup
+    glDeleteTextures(1, &yTexture);
+    if (uvTexture)
+        glDeleteTextures(1, &uvTexture);
+    eglDestroyImageKHR(gfx->eglDisplay, yImage);
+    if (uvImage != EGL_NO_IMAGE)
+        eglDestroyImageKHR(gfx->eglDisplay, uvImage);
+
+    // printf("Rendered YUV planes to RGB texture\n");
+
+    glDeleteTextures(1, &externalTexture);
+    eglDestroyImageKHR(gfx->eglDisplay, image);
+    return 1;
 }
 
 void gfxRender(struct Gfx * gfx)
@@ -237,10 +582,11 @@ void gfxRender(struct Gfx * gfx)
         }
         gfx->sample = sample;
 
-        GLuint outTexture = 0;
-        if (gfxConvertSample(gfx, &outTexture)) {
-            // TODO: cleanup old videoTexture
-            gfx->videoTexture = outTexture;
+        if (gfxConvertSample(gfx)) {
+            if (gfx->videoTexture && gfx->videoTexture != gfx->rgbTexture) {
+                glDeleteTextures(1, &gfx->videoTexture);
+            }
+            gfx->videoTexture = gfx->rgbTexture;
         } else {
             gfx->videoTexture = 0;
         }
@@ -250,20 +596,23 @@ void gfxRender(struct Gfx * gfx)
     GLint texCoordAttrib = glGetAttribLocation(gfx->shaderProgram, "texCoord");
     GLint textureUniform = glGetUniformLocation(gfx->shaderProgram, "u_texture");
 
-    glClearColor(0.0, 0.0, 0.1, 1.0);
+    glViewport(0, 0, gfx->width, gfx->height);
+    glClearColor(0.0, 0.0, 0.5, 1.0);
     glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(gfx->shaderProgram);
 
     glEnableVertexAttribArray(positionAttrib);
-    glVertexAttribPointer(positionAttrib, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), vertices);
+    glVertexAttribPointer(positionAttrib, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), renderVertices);
 
     glEnableVertexAttribArray(texCoordAttrib);
-    glVertexAttribPointer(texCoordAttrib, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), vertices + 2);
+    glVertexAttribPointer(texCoordAttrib, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), renderVertices + 2);
 
     glActiveTexture(GL_TEXTURE0);
     if (gfx->videoTexture) {
+        // printf("Using video texture %d\n", gfx->videoTexture);
         glBindTexture(GL_TEXTURE_2D, gfx->videoTexture);
     } else {
+        // printf("Using debug texture %d\n", gfx->debugTexture);
         glBindTexture(GL_TEXTURE_2D, gfx->debugTexture);
     }
     glUniform1i(textureUniform, 0);
